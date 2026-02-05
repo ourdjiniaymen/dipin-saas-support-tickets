@@ -132,7 +132,4 @@ cp .env.example .env
 
 # 2. Start services
 docker compose up --build
-
-# 3. Run tests (optional)
-docker compose exec app pytest
 ```
