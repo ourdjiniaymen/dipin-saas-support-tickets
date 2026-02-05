@@ -5,6 +5,9 @@ import asyncio
 from src.db.mongo import get_db
 from src.services.classify_service import ClassifyService
 from src.services.notify_service import NotifyService
+from src.services.lock_service import LockService
+from uuid import uuid4
+
 
 # ============================================================
 # 🐛 DEBUG TASK C: Memory leak
@@ -28,30 +31,33 @@ class IngestService:
         notifications and logging.
         """
         db = await get_db()
-
-        # ============================================================
+        
         # 🐛 DEBUG TASK D: Race condition
-        # Check-then-act pattern: concurrent requests can both pass.
-        # ============================================================
-        existing_job = await db.ingestion_jobs.find_one({
-            "tenant_id": tenant_id,
-            "status": "running"
-        })
+        # Fixed by MongoDB-based distributed lock (see LockService)
 
-        # 🐛 If a context switch happens here, multiple requests can pass this point.
-        await asyncio.sleep(0)  # intentional yield point
 
-        if existing_job:
+
+        # 1 - Acquire Lock
+        lock_service = LockService()
+        job_id = str(uuid4()) # get id without db writing
+       
+        acquired = await lock_service.acquire_lock(
+                resource_id=f"ingest:{tenant_id}",
+                owner_id=job_id
+            )
+        
+        if not acquired:
             return {
                 "status": "already_running",
-                "job_id": str(existing_job["_id"]),
+                "job_id": None,
                 "new_ingested": 0,
                 "updated": 0,
                 "errors": 0
             }
-
-        # Record ingestion job start
+        
+        # Create Job Record
         job_doc = {
+            "_id": job_id,
             "tenant_id": tenant_id,
             "status": "running",
             "started_at": datetime.utcnow(),
@@ -59,8 +65,7 @@ class IngestService:
             "total_pages": None,
             "processed_pages": 0
         }
-        result = await db.ingestion_jobs.insert_one(job_doc)
-        job_id = str(result.inserted_id)
+        await db.ingestion_jobs.insert_one(job_doc)
 
         # ============================================================
         # 🐛 DEBUG TASK C: Memory leak (continued)
@@ -90,8 +95,44 @@ class IngestService:
 
             # 🐛 Memory leak: all tickets are stored in the cache.
             # _ingestion_cache[cache_key]["tickets"].append(ticket_data)
+  
+            #  Fetch Tickets with Manual Pagination
+            async with httpx.AsyncClient(timeout=10) as client:
+                page = 1
+                while True:
+                    resp = await client.get(
+                        self.external_api_url,
+                        params={"tenant_id": tenant_id, "page": page}
+                    )
+                    tickets = resp.json()
+                    if not tickets:
+                        break
 
-            pass
+                    for ticket in tickets:
+                        classification = self.classify_service.classify(
+                            ticket["subject"], ticket["message"]
+                        )
+
+                        result = await db.tickets.update_one(
+                            {"tenant_id": tenant_id, "external_id": ticket["id"]},
+                            {"$set": {
+                                **ticket,
+                                **classification,
+                                "tenant_id": tenant_id,
+                                "external_id": ticket["id"],
+                                "updated_at": datetime.utcnow()
+                            }},
+                            upsert=True
+                        )
+
+                        # Increment counters
+                        if result.upserted_id:
+                            new_ingested += 1
+                        elif result.modified_count > 0:
+                            updated += 1
+
+                    page += 1
+
 
         except Exception as e:
             # Always log failures
@@ -107,10 +148,16 @@ class IngestService:
                 "errors": errors
             })
             raise
+        finally:
+            # Release Lock
+            await lock_service.release_lock(
+                resource_id=f"ingest:{tenant_id}",
+                owner_id=job_id
+            )
 
         # Log successful completion
         await db.ingestion_jobs.update_one(
-            {"_id": result.inserted_id},
+            {"_id": job_id},
             {"$set": {"status": "completed", "ended_at": datetime.utcnow()}}
         )
 
@@ -136,9 +183,9 @@ class IngestService:
     async def get_job_status(self, job_id: str) -> Optional[dict]:
         """Retrieve the status of a specific ingestion job."""
         db = await get_db()
-        from bson import ObjectId
+        #from bson import ObjectId
 
-        job = await db.ingestion_jobs.find_one({"_id": ObjectId(job_id)})
+        job = await db.ingestion_jobs.find_one({"_id":job_id})
         if not job:
             return None
 
@@ -156,10 +203,10 @@ class IngestService:
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel an ongoing ingestion job, if it is still running."""
         db = await get_db()
-        from bson import ObjectId
+        #from bson import ObjectId
 
         result = await db.ingestion_jobs.update_one(
-            {"_id": ObjectId(job_id), "status": "running"},
+            {"_id":job_id, "status": "running"},
             {"$set": {"status": "cancelled", "ended_at": datetime.utcnow()}}
         )
         return result.modified_count > 0
