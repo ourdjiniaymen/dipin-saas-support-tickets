@@ -16,27 +16,45 @@ async def create_indexes():
     # patterns and will cause performance issues.
     # ============================================================
 
-    # 🐛 Issue 1: Index on created_at without tenant_id
-    # Most queries filter by tenant_id, so this index is rarely used.
-    await tickets.create_index([("created_at", pymongo.ASCENDING)])
+    # Index 1 — Idempotency
+    await tickets.create_index(
+        [("tenant_id", pymongo.ASCENDING), ("external_id", pymongo.ASCENDING)],
+        unique=True,
+        name="idx_tenant_external_unique"
+    )
 
-    # 🐛 Issue 2: Single-field index on a low-cardinality field
-    # status has only three values (open/closed/pending), so selectivity is low.
-    await tickets.create_index([("status", pymongo.ASCENDING)])
+    # Index 2 - Stats / Listing
+    await tickets.create_index(
+        [("tenant_id", pymongo.ASCENDING), ("created_at", pymongo.DESCENDING)],
+        name="idx_tenant_created"
+    )
 
-    # 🐛 Issue 3: Single-field index on urgency (also low cardinality)
-    await tickets.create_index([("urgency", pymongo.ASCENDING)])
+    # Index 3 - Status Filterd Stats
+    await tickets.create_index(
+        [
+            ("tenant_id", pymongo.ASCENDING),
+            ("status", pymongo.ASCENDING),
+            ("created_at", pymongo.DESCENDING)
+        ],
+        name="idx_tenant_status_created"
+    )
+    
+    # Index 4: urgency for analytics
+    await tickets.create_index(
+        [("tenant_id", pymongo.ASCENDING), ("urgency", pymongo.ASCENDING)],
+        name="idx_tenant_urgency"
+    )
 
-     # 🐛 Issue 4: Wrong order in composite index
-    # Queries typically filter by tenant_id and then sort by created_at,
-    # but this index uses the reverse order.
-    await tickets.create_index([
-        ("created_at", pymongo.DESCENDING),
-        ("tenant_id", pymongo.ASCENDING)
-    ])
+    # Index 5: soft delete filtering
+    await tickets.create_index(
+        [("tenant_id", pymongo.ASCENDING), ("deleted_at", pymongo.ASCENDING)],
+        name="idx_tenant_deleted"
+    )
 
-    # 🐛 Issue 5: Missing unique index for idempotency
-    # The (tenant_id, external_id) pair should be unique to prevent duplicates.
+
+
+
+    
 
     # ingestion_jobs 컬렉션 인덱스
     ingestion_jobs = db.ingestion_jobs
